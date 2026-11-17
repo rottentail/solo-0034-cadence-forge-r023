@@ -54,36 +54,26 @@ func (s *Service) loop(ctx context.Context) {
 		}
 	}
 }
+
+// claim asks the domain policy to start the oldest queued render's next
+// attempt inside one durable transaction, then registers the OS-level cancel
+// handle only after that decision is durable.
 func (s *Service) claim(cancel context.CancelFunc) (domain.Render, bool, error) {
 	s.mutation.Lock()
 	defer s.mutation.Unlock()
 	var out domain.Render
 	found := false
 	err := s.Store.Update(func(st *domain.State) error {
-		ids := []string{}
-		for id, r := range st.Renders {
-			if r.State == "queued" {
-				ids = append(ids, id)
-			}
-		}
-		sort.Slice(ids, func(i, j int) bool {
-			a, b := st.Renders[ids[i]], st.Renders[ids[j]]
-			if a.CreatedAt.Equal(b.CreatedAt) {
-				return ids[i] < ids[j]
-			}
-			return a.CreatedAt.Before(b.CreatedAt)
-		})
-		if len(ids) == 0 {
+		id := oldestQueued(st)
+		if id == "" {
 			return nil
 		}
-		r := st.Renders[ids[0]]
-		r.State = "running"
-		r.UpdatedAt = time.Now().UTC()
-		r.Attempts = append(r.Attempts, domain.Attempt{Number: len(r.Attempts) + 1, StartedAt: r.UpdatedAt, Outcome: "running"})
-		st.Renders[r.ID] = r
-		st.Emit(r.ID, "render.started", fmt.Sprint(len(r.Attempts)))
+		r, ok, e := st.StartAttempt(id, time.Now().UTC())
+		if e != nil {
+			return e
+		}
 		out = r
-		found = true
+		found = ok
 		return nil
 	})
 	if err == nil && found {
@@ -93,42 +83,75 @@ func (s *Service) claim(cancel context.CancelFunc) (domain.Render, bool, error) 
 	}
 	return out, found && err == nil, err
 }
+
+func oldestQueued(st *domain.State) string {
+	ids := []string{}
+	for id, r := range st.Renders {
+		if r.State == domain.StateQueued {
+			ids = append(ids, id)
+		}
+	}
+	sort.Slice(ids, func(i, j int) bool {
+		a, b := st.Renders[ids[i]], st.Renders[ids[j]]
+		if a.CreatedAt.Equal(b.CreatedAt) {
+			return ids[i] < ids[j]
+		}
+		return a.CreatedAt.Before(b.CreatedAt)
+	})
+	if len(ids) == 0 {
+		return ""
+	}
+	return ids[0]
+}
+
+// execute runs the physical work outside the mutation lock. The lifecycle
+// decision is not taken here: when the IO finishes, execute hands the observed
+// effect to the policy at the commit boundary. Two distinct boundaries matter:
+//
+//   - Physical effects (encoding, inspection, promotion) happen first and can
+//     be abandoned; an orphaned directory is retained conservatively, never
+//     treated as proof of success.
+//   - The durable terminal decision happens in one transaction, and only while
+//     the render is still this exact running attempt. A cancellation or a
+//     restart interruption that landed first makes the commit a no-op, so a
+//     late old attempt can never publish over a newer fact.
 func (s *Service) execute(ctx context.Context, r domain.Render) {
 	attempt := len(r.Attempts)
 	stage, err := s.Blobs.Staging(r.ID, attempt)
 	if err != nil {
-		s.complete(r, nil, err)
+		s.complete(r.ID, attempt, nil, err)
 		return
 	}
 	defer os.RemoveAll(stage)
 	for _, source := range r.Sources {
 		path, e := s.Blobs.Object(source.Digest)
 		if e != nil {
-			s.complete(r, nil, e)
+			s.complete(r.ID, attempt, nil, e)
 			return
 		}
 		digest, n, e := inspect.Digest(path)
 		if e != nil {
-			s.complete(r, nil, e)
+			s.complete(r.ID, attempt, nil, e)
 			return
 		}
 		if digest != source.Digest || n != source.Bytes {
-			s.complete(r, nil, fmt.Errorf("source content integrity failed"))
+			s.complete(r.ID, attempt, nil, fmt.Errorf("source content integrity failed"))
 			return
 		}
 	}
 	runner := encoding.Runner{Binary: s.Config.FFmpeg, Blobs: s.Blobs}
 	name, err := runner.Encode(ctx, r, stage)
 	if err != nil {
-		s.complete(r, nil, err)
+		s.complete(r.ID, attempt, nil, err)
 		return
 	}
 	inspection, err := inspect.Artifact(ctx, s.Probe, filepath.Join(stage, name), r)
 	if err != nil {
-		s.complete(r, nil, err)
+		s.complete(r.ID, attempt, nil, err)
 		return
 	}
 	artifact := &domain.Artifact{Filename: name, CaptionFile: "captions.vtt", Inspection: inspection}
+
 	s.mutation.Lock()
 	defer s.mutation.Unlock()
 	st, err := s.Store.Snapshot()
@@ -137,46 +160,35 @@ func (s *Service) execute(ctx context.Context, r domain.Render) {
 		return
 	}
 	current, ok := st.Renders[r.ID]
-	if !ok || current.State != "running" || len(current.Attempts) != attempt {
+	// Commit boundary precondition: the render is still this attempt and still
+	// running. If cancel or restart already decided it, the finished work is
+	// discarded with the staging directory and no state is written.
+	if !ok || current.State != domain.StateRunning || len(current.Attempts) != attempt {
 		return
 	}
 	if err = s.Blobs.Promote(stage, r.ID, attempt); err != nil {
-		s.completeLocked(r, nil, err)
+		s.completeLocked(r.ID, attempt, nil, err)
 		return
 	}
-	s.completeLocked(r, artifact, nil)
+	s.completeLocked(r.ID, attempt, artifact, nil)
 }
-func (s *Service) complete(r domain.Render, a *domain.Artifact, cause error) {
+
+func (s *Service) complete(id string, attempt int, a *domain.Artifact, cause error) {
 	s.mutation.Lock()
 	defer s.mutation.Unlock()
-	s.completeLocked(r, a, cause)
+	s.completeLocked(id, attempt, a, cause)
 }
-func (s *Service) completeLocked(r domain.Render, a *domain.Artifact, cause error) {
+
+// completeLocked opens the single durable transaction that turns an attempt's
+// observed effect into a lifecycle fact. The policy rejects any render that is
+// no longer the same running attempt, so mixed facts are impossible even under
+// real process-exit delays or forced termination.
+func (s *Service) completeLocked(id string, attempt int, a *domain.Artifact, cause error) {
 	err := s.Store.Update(func(st *domain.State) error {
-		current, ok := st.Renders[r.ID]
-		if !ok || current.State != "running" || len(current.Attempts) != len(r.Attempts) {
-			return nil
-		}
-		current.UpdatedAt = time.Now().UTC()
-		last := &current.Attempts[len(current.Attempts)-1]
-		last.FinishedAt = &current.UpdatedAt
-		if cause != nil {
-			current.State = "failed"
-			last.Outcome = "failed"
-			last.Detail = cause.Error()
-			if len(last.Detail) > 8192 {
-				last.Detail = last.Detail[:8192]
-			}
-		} else {
-			current.State = "succeeded"
-			last.Outcome = "succeeded"
-			current.Artifact = a
-		}
-		st.Renders[r.ID] = current
-		st.Emit(r.ID, "render."+current.State, last.Detail)
-		return nil
+		_, e := st.CompleteAttempt(id, attempt, a, cause, time.Now().UTC())
+		return e
 	})
 	if err != nil {
-		slog.Error("commit render result", "render", r.ID, "error", err)
+		slog.Error("commit render result", "render", id, "error", err)
 	}
 }

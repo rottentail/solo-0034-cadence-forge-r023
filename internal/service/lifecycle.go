@@ -5,31 +5,20 @@ import (
 	"time"
 )
 
+// Cancel and Retry are application boundaries: they hold the mutation lock and
+// open one durable transaction, but every rule about which state may move where
+// is decided by the domain lifecycle policy. Cancellation is acknowledged as
+// soon as the decision is durable; process teardown happens after the commit so
+// callers never wait on IO that is not promised to finish synchronously.
 func (s *Service) Cancel(id string) (domain.Render, error) {
 	s.mutation.Lock()
 	defer s.mutation.Unlock()
 	var out domain.Render
 	err := s.Store.Update(func(st *domain.State) error {
-		r, ok := st.Renders[id]
-		if !ok {
-			return domain.Missing("render", id)
+		r, e := st.Cancel(id, time.Now().UTC())
+		if e != nil {
+			return e
 		}
-		if r.State == "cancelled" {
-			out = r
-			return nil
-		}
-		if domain.Terminal(r.State) {
-			return domain.Conflict("completed render cannot be cancelled")
-		}
-		r.State = "cancelled"
-		r.UpdatedAt = time.Now().UTC()
-		if len(r.Attempts) > 0 {
-			a := &r.Attempts[len(r.Attempts)-1]
-			a.Outcome = "cancelled"
-			a.FinishedAt = &r.UpdatedAt
-		}
-		st.Renders[id] = r
-		st.Emit(id, "render.cancelled", "artifact visibility revoked before acknowledgement")
 		out = r
 		return nil
 	})
@@ -42,34 +31,16 @@ func (s *Service) Cancel(id string) (domain.Render, error) {
 	}
 	return out, err
 }
+
 func (s *Service) Retry(id string) (domain.Render, error) {
 	s.mutation.Lock()
 	defer s.mutation.Unlock()
 	var out domain.Render
 	err := s.Store.Update(func(st *domain.State) error {
-		r, ok := st.Renders[id]
-		if !ok {
-			return domain.Missing("render", id)
+		r, e := st.Retry(id, s.Config.QueueLimit, time.Now().UTC())
+		if e != nil {
+			return e
 		}
-		if r.State != "failed" {
-			return domain.Conflict("only failed render can retry")
-		}
-		if len(r.Attempts) >= 3 {
-			return domain.Conflict("three-attempt limit reached")
-		}
-		pending := 0
-		for _, other := range st.Renders {
-			if other.State == "queued" || other.State == "running" {
-				pending++
-			}
-		}
-		if pending >= s.Config.QueueLimit {
-			return domain.Capacity("render queue is full")
-		}
-		r.State = "queued"
-		r.UpdatedAt = time.Now().UTC()
-		st.Renders[id] = r
-		st.Emit(id, "render.retried", "original frozen inputs retained")
 		out = r
 		return nil
 	})

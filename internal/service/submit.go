@@ -36,12 +36,7 @@ func (s *Service) Submit(key string, request Request) (domain.Render, error) {
 				return nil
 			}
 		}
-		pending := 0
-		for _, r := range st.Renders {
-			if r.State == "queued" || r.State == "running" {
-				pending++
-			}
-		}
+		pending := domain.PendingRenders(st)
 		if pending >= s.Config.QueueLimit {
 			return domain.Capacity("render queue is full")
 		}
@@ -69,7 +64,7 @@ func (s *Service) Submit(key string, request Request) (domain.Render, error) {
 		plan.VTT = caption.VTT(caption.Map(sheet, plan))
 		now := time.Now().UTC()
 		id := ID()
-		out = domain.Render{ID: id, Key: key, RequestHash: fingerprint, Sheet: sheet, Recipe: recipe, Sources: sources, Plan: plan, State: "queued", Attempts: []domain.Attempt{}, CreatedAt: now, UpdatedAt: now}
+		out = domain.Render{ID: id, Key: key, RequestHash: fingerprint, Sheet: sheet, Recipe: recipe, Sources: sources, Plan: plan, State: domain.StateQueued, Attempts: []domain.Attempt{}, CreatedAt: now, UpdatedAt: now}
 		st.Renders[id] = out
 		st.Emit(id, "render.queued", "frozen source and recipe revisions")
 		return nil

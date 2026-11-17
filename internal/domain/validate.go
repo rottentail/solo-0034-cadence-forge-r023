@@ -116,12 +116,15 @@ func ValidateState(s State) error {
 		}
 		keys[r.Key] = true
 		switch r.State {
-		case "queued", "running", "succeeded", "failed", "cancelled":
+		case StateQueued, StateRunning, StateSucceeded, StateFailed, StateCancelled:
 		default:
 			return fmt.Errorf("invalid render state")
 		}
-		if (r.State == "succeeded") != (r.Artifact != nil) {
+		if (r.State == StateSucceeded) != (r.Artifact != nil) {
 			return fmt.Errorf("artifact state mismatch")
+		}
+		if err := validateAttempts(r); err != nil {
+			return err
 		}
 		if r.Sources == nil {
 			return fmt.Errorf("missing render source snapshot")
@@ -139,6 +142,44 @@ func ValidateState(s State) error {
 			return fmt.Errorf("event sequence is invalid")
 		}
 		previous = e.Sequence
+	}
+	return nil
+}
+
+// validateAttempts keeps the attempt ledger consistent with the render state.
+// It enforces only facts that every lifecycle rule already maintains: attempt
+// numbers are dense, in-flight attempts exist only on running renders, and a
+// terminal render's last attempt carries a finished outcome. This is the
+// independent review surface that guarantees the attempt rule and the terminal
+// rule describe the same render without mixing facts.
+func validateAttempts(r Render) error {
+	for i, a := range r.Attempts {
+		if a.Number != i+1 {
+			return fmt.Errorf("invalid attempt numbering")
+		}
+		switch a.Outcome {
+		case OutcomeRunning, OutcomeSucceeded, OutcomeFailed, OutcomeCancelled, OutcomeInterrupted:
+		default:
+			return fmt.Errorf("invalid attempt outcome")
+		}
+		if (a.Outcome == OutcomeRunning) != (a.FinishedAt == nil) {
+			return fmt.Errorf("attempt finish marker mismatch")
+		}
+	}
+	last := len(r.Attempts) - 1
+	switch r.State {
+	case StateRunning:
+		if last < 0 || r.Attempts[last].Outcome != OutcomeRunning {
+			return fmt.Errorf("running render requires an in-flight attempt")
+		}
+	case StateSucceeded:
+		if last < 0 || r.Attempts[last].Outcome != OutcomeSucceeded {
+			return fmt.Errorf("succeeded render requires a succeeded attempt")
+		}
+	case StateFailed, StateCancelled:
+		if last >= 0 && r.Attempts[last].Outcome == OutcomeRunning {
+			return fmt.Errorf("terminal render cannot keep an in-flight attempt")
+		}
 	}
 	return nil
 }

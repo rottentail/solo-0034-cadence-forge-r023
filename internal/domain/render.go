@@ -58,6 +58,3 @@ func (s *State) Emit(id, kind, detail string) {
 	s.Sequence++
 	s.Events = append(s.Events, Event{Sequence: s.Sequence, Subject: id, Kind: kind, Detail: detail, At: time.Now().UTC()})
 }
-func Terminal(state string) bool {
-	return state == "succeeded" || state == "failed" || state == "cancelled"
-}

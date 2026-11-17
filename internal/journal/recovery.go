@@ -5,22 +5,13 @@ import (
 	"time"
 )
 
+// Recover re-establishes durable facts at startup. The interruption rule itself
+// lives in the domain policy; the journal only supplies the durable boundary.
 func (s *Store) Recover() error {
 	return s.Update(func(st *domain.State) error {
-		for id, r := range st.Renders {
-			if r.State != "running" {
-				continue
-			}
-			r.State = "failed"
-			r.UpdatedAt = time.Now().UTC()
-			if len(r.Attempts) > 0 {
-				a := &r.Attempts[len(r.Attempts)-1]
-				a.FinishedAt = &r.UpdatedAt
-				a.Outcome = "interrupted"
-				a.Detail = "process ended before artifact commit"
-			}
-			st.Renders[id] = r
-			st.Emit(id, "render.interrupted", "explicit retry required; frozen input retained")
+		now := time.Now().UTC()
+		for id := range st.Renders {
+			st.Interrupt(id, now)
 		}
 		return nil
 	})

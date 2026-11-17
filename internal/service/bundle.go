@@ -21,7 +21,7 @@ func (s *Service) Artifact(id string) (domain.Render, string, error) {
 	if !ok {
 		return r, "", domain.Missing("render", id)
 	}
-	if r.State != "succeeded" || r.Artifact == nil {
+	if r.State != domain.StateSucceeded || r.Artifact == nil {
 		return r, "", domain.Conflict("render has no committed artifact")
 	}
 	dir, err := s.Blobs.RenderDir(id, len(r.Attempts))
